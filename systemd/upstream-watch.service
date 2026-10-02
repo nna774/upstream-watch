@@ -1,0 +1,29 @@
+[Unit]
+Description=Detect upstream (BGP peer / transit / first hops) changes and notify
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/upstream-watch
+
+# root は要らない。mtr は非特権 ICMP datagram socket を使うので CAP_NET_RAW も不要
+# (Debian 12 / net.ipv4.ping_group_range で確認済み)
+User=upstream-watch
+Group=upstream-watch
+# ssh が ~/.ssh を探して警告を吐かないように向けておく
+Environment=HOME=/var/lib/upstream-watch
+
+# postdrop は setgid postdrop。NoNewPrivileges 下では setgid が効かないので
+# 最初から postdrop グループを渡す (これが無いと maildrop に書けず sendmail が詰まる)
+SupplementaryGroups=postdrop
+
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+# sendmail (postdrop) が投函するキュー
+ReadWritePaths=/var/lib/upstream-watch /var/spool/postfix/maildrop
+
+# Type=oneshot の既定は無限。probe や sendmail が詰まったときに居座らせない
+TimeoutStartSec=300

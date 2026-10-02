@@ -1,0 +1,142 @@
+#!/usr/bin/env bash
+#
+# EdgeOS (quagga) ルータの BGP から上流のシグネチャを作る。
+#
+# ルータ上にはスクリプト 1 本だけ置き、残りは ssh で取りに行く。ER-X 系は
+# ファームウェア更新で /config 外が消えるので、監視の実体は配下のホストに寄せる。
+#
+# 最重要の監視対象は default に付いてくる community。今の quagga は
+# RFC 8326 GRACEFUL_SHUTDOWN (65535:0) を honor しないので、上流が drain に
+# 入ったことを知る手段が community を見る以外に無い。
+#
+set -euo pipefail
+
+if [[ -z "${ROUTER_RAW_FILE:-}" ]]; then
+  : "${ROUTER_SSH:?ROUTER_SSH が未設定 (例: uwatch@192.0.2.1)}"
+fi
+SSH_OPTS="${ROUTER_SSH_OPTS:--o BatchMode=yes -o ConnectTimeout=10}"
+# ルータ側の /config/scripts/upstream-watch-fetch が 6 セクションを吐く。
+# 鍵は sshd_config の Match User + ForceCommand でこの 1 本に固定する。
+# EdgeOS は設定値に " を書けないので authorized_keys の command= は使えず、
+# operator level には shell が無い (Vyatta::Login::User が nologin にする) ため
+# admin level + ForceCommand が唯一の組み合わせになる
+FETCH_CMD="${ROUTER_FETCH_CMD:-/config/scripts/upstream-watch-fetch}"
+
+# ルータ側のスクリプトと一致していなければならない
+SPLIT='===upstream-watch-split==='
+
+# パーサの検証用に、取得済みの出力を食わせられるようにしておく
+if [[ -n "${ROUTER_RAW_FILE:-}" ]]; then
+  raw="$(cat "$ROUTER_RAW_FILE")"
+else
+  # shellcheck disable=SC2086
+  raw="$(ssh $SSH_OPTS "$ROUTER_SSH" "$FETCH_CMD")"
+fi
+
+section() {
+  awk -v want="$1" -v sep="$SPLIT" '
+    $0 == sep { n++; next }
+    n == want - 1 { print }
+  ' <<<"$raw"
+}
+
+# Up/Down は経過時間なので落とす。state/PfxRcd は "Idle (Admin)" のように
+# 空白を含むので最終カラムではなく 10 列目以降をまとめて取る。
+parse_summary() {
+  local pfx="$1"
+  awk -v pfx="$pfx" '
+    { sub(/^[ \t]+/, "") }
+    /^Neighbor[ \t]+V/ { body = 1; next }
+    !body { next }
+    NF == 0 { body = 0; next }
+    # quagga は 15 桁を超える neighbor を単独行に折り返す
+    NF == 1 && $1 ~ /[.:]/ { pend = $1; next }
+    {
+      line = (pend == "" ? $0 : pend " " $0); pend = ""
+      n = split(line, f, /[ \t]+/)
+      if (f[1] !~ /[.:]/) next
+      # 長い v6 アドレスは V 列と地続きに印字される。その場合 V を切り離す
+      if (length(f[2]) == 1) {
+        as = f[3]; first = 10
+      } else {
+        sub(/[0-9]$/, "", f[1]); as = f[2]; first = 9
+      }
+      if (n < first) next
+      state = f[first]
+      for (i = first + 1; i <= n; i++) state = state " " f[i]
+      # 確立していないピアは Idle/Connect/Active を巡回するので畳む。
+      # 数値は PfxRcd、"Idle (Admin)" は shutdown 指定なのでどちらも保つ
+      if (state ~ /^[0-9]+$/)            state = "pfx=" state
+      else if (state ~ /^Idle \(Admin\)/) state = "admin-shutdown"
+      else                               state = "down"
+      printf "%s peer %s as=%s %s\n", pfx, f[1], as, state
+    }
+  ' | sort
+}
+
+# community は 1 要素 1 行で出す。出現順に依存せず、増減が diff の 1 行になる
+parse_paths() {
+  local pfx="$1"
+  awk -v pfx="$pfx" '
+    function flush() {
+      if (from == "") return
+      printf "%s path %s attr rid=%s lp=%s weight=%s best=%s\n", pfx, from, rid, lp, w, best
+      for (i = 1; i <= nc; i++) printf "%s path %s comm %s\n", pfx, from, comm[i]
+      from = ""; nc = 0
+    }
+    { sub(/^[ \t]+/, "") }
+    /^Last update:/ { next }
+    # v6 では nexthop に link-local が括弧で付く: 2001:db8::1(fe80::1) from ...
+    /^[0-9a-fA-F.:]+(\([0-9a-fA-F:]+\))? from [0-9a-fA-F.:]+ \(/ {
+      flush()
+      from = $3
+      rid = $4; gsub(/[()]/, "", rid)
+      lp = "-"; w = "-"; best = "no"
+      next
+    }
+    /^Origin / {
+      if (match($0, /localpref [0-9]+/)) lp = substr($0, RSTART + 10, RLENGTH - 10)
+      if (match($0, /weight [0-9]+/))    w  = substr($0, RSTART + 7, RLENGTH - 7)
+      if ($0 ~ /(^|[, ])best([,.]|$)/)   best = "yes"
+      next
+    }
+    /^(Community|Extended Community|Large Community):/ {
+      sub(/^[^:]*:[ \t]*/, "")
+      n = split($0, c, /[ \t]+/)
+      for (i = 1; i <= n; i++) if (c[i] != "") comm[++nc] = c[i]
+      next
+    }
+    END { flush() }
+  ' | sort
+}
+
+# RA 由来の default には expires が付いて毎回変わる
+normalize_routes() {
+  local pfx="$1"
+  sed -e 's/expires [0-9]*sec//' \
+    | tr -s '[:blank:]' ' ' \
+    | sed -e 's/^ //' -e 's/ *$//' \
+    | sed -e '/^$/d' \
+    | sed -e "s/^/${pfx} /" \
+    | sort
+}
+
+# 空なら default を受けていない。これ自体が通知に値する状態なので (none) を出す
+emit() {
+  local pfx="$1" out
+  out="$(cat)"
+  if [[ -z "$out" ]]; then
+    printf '%s (none)\n' "$pfx"
+  else
+    printf '%s\n' "$out"
+  fi
+}
+
+{
+  section 1 | parse_summary 'summary4' | emit 'summary4'
+  section 2 | parse_summary 'summary6' | emit 'summary6'
+  section 3 | parse_paths 'default4'   | emit 'default4'
+  section 4 | parse_paths 'default6'   | emit 'default6'
+  section 5 | normalize_routes 'route4' | emit 'route4'
+  section 6 | normalize_routes 'route6' | emit 'route6'
+}

@@ -1,0 +1,66 @@
+#!/usr/bin/env python3
+"""RIPEstat から見た上流 AS の集合をシグネチャにする。
+
+自分のインフラを一切使わずに「上流 AS の構成が変わったか」が分かる唯一の視点。
+監視対象が丸ごと死んでいても観測できる反面、asn-neighbours の更新は 1 日 1 回
+なので障害検知には使えない。
+"""
+
+import collections
+import json
+import os
+import sys
+import urllib.parse
+import urllib.request
+
+ASN = os.environ["RIPE_ASN"]
+PREFIX = os.environ["RIPE_PREFIX"]
+# 1 本の観測だけで現れる AS は leak や collector 固有の揺れなので足切りする
+MIN_ROUTES = int(os.environ.get("RIPE_MIN_ROUTES", "3"))
+TIMEOUT = int(os.environ.get("RIPE_TIMEOUT", "30"))
+
+BASE = "https://stat.ripe.net/data"
+
+
+def fetch(endpoint, resource):
+    url = "%s/%s/data.json?%s" % (
+        BASE, endpoint, urllib.parse.urlencode({"resource": resource})
+    )
+    with urllib.request.urlopen(url, timeout=TIMEOUT) as res:
+        return json.load(res)["data"]
+
+
+def holder(asn, cache={}):
+    if asn not in cache:
+        cache[asn] = fetch("as-overview", "AS%s" % asn).get("holder") or "?"
+    return cache[asn]
+
+
+def neighbours():
+    # power と peer 数は日々動くのでシグネチャに入れない
+    data = fetch("asn-neighbours", "AS%s" % ASN)
+    for n in data.get("neighbours", []):
+        if n.get("type") != "left":
+            continue
+        asn = str(n["asn"])
+        yield "ripe neighbour left AS%s %s" % (asn, holder(asn))
+
+
+def transits():
+    data = fetch("bgp-state", PREFIX)
+    seen = collections.Counter()
+    for route in data.get("bgp_state", []):
+        path = [str(a) for a in route.get("path", [])]
+        if len(path) < 2 or path[-1] != ASN:
+            continue
+        seen[path[-2]] += 1
+    for asn, count in seen.items():
+        if count < MIN_ROUTES:
+            continue
+        yield "ripe transit %s AS%s %s" % (PREFIX, asn, holder(asn))
+
+
+lines = sorted(set(neighbours()) | set(transits()))
+if not lines:
+    sys.exit("RIPEstat から上流が 1 つも取れなかった")
+print("\n".join(lines))

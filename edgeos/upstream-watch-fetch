@@ -1,0 +1,13 @@
+#!/bin/bash
+#
+# upstream-watch の 10-edgeos-bgp 専用の読み取り。
+# sshd_config の ForceCommand で固定して呼ぶため、要求されたコマンドは無視する。
+#
+SPLIT='===upstream-watch-split==='
+
+vtysh -c 'show ip bgp summary'   ; echo "$SPLIT"
+vtysh -c 'show bgp ipv6 summary' ; echo "$SPLIT"
+vtysh -c 'show ip bgp 0.0.0.0/0' ; echo "$SPLIT"
+vtysh -c 'show bgp ipv6 ::/0'    ; echo "$SPLIT"
+ip -4 route show default         ; echo "$SPLIT"
+ip -6 route show default

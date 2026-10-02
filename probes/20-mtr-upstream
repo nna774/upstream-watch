@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+#
+# ルータから数ホップ分だけの経路を測り、どの上流に出ているかのシグネチャを作る。
+#
+# ホップ列を全長で比較すると自分の上流より外の ECMP と負荷分散で揺れ続けるので、
+# 既定では先頭 4 ホップ (自ルータ → 上流 → その先) だけを見る。
+#
+set -euo pipefail
+
+CONFIG_DIR="${CONFIG_DIR:-/etc/upstream-watch}"
+TARGETS_FILE="${UPSTREAM_MTR_TARGETS_FILE:-${CONFIG_DIR}/targets.conf}"
+HOPS="${UPSTREAM_MTR_HOPS:-4}"
+COUNT="${UPSTREAM_MTR_COUNT:-5}"
+
+if [[ ! -f "$TARGETS_FILE" ]]; then
+  printf 'ターゲット定義が無い: %s\n' "$TARGETS_FILE" >&2
+  exit 1
+fi
+
+probe_target() {
+  local family="$1" target="$2"
+  # 測定失敗は probe 全体の失敗にする。部分的な欠落を変化として通知しないため
+  mtr -n -r -c "$COUNT" -m "$HOPS" "$family" -- "$target" \
+    | awk -v family="$family" -v target="$target" '
+        /^[ \t]*[0-9]+\.\|--/ {
+          hop = $1; sub(/\.\|--$/, "", hop)
+          printf "mtr %s %s hop %s %s\n", family, target, hop, $2
+        }
+      '
+}
+
+while IFS= read -r line || [[ -n "$line" ]]; do
+  line="${line%%#*}"
+  # shellcheck disable=SC2086
+  set -- $line
+  [[ $# -eq 0 ]] && continue
+
+  family='-4'
+  if [[ "$1" == '-4' || "$1" == '-6' ]]; then
+    family="$1"
+    shift
+  fi
+  [[ $# -eq 0 ]] && continue
+
+  probe_target "$family" "$1"
+done < "$TARGETS_FILE"

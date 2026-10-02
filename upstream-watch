@@ -1,0 +1,277 @@
+#!/usr/bin/env bash
+#
+# upstream-watch — 上流の同一性を表すシグネチャを probe ごとに集め、
+# 前回から変化していたら通知する。systemd-timer から oneshot で叩く想定。
+#
+# probe の規約:
+#   - 標準出力にシグネチャ (前回と比較可能な安定したテキスト) を書く
+#   - 終了コード 0 で成功。非 0 なら測定失敗として扱い、state を更新しない
+#   - 時刻・経過時間・RTT のような毎回変わる値はシグネチャに含めない
+#
+set -euo pipefail
+
+CONFIG_DIR="${UPSTREAM_WATCH_CONFIG_DIR:-/etc/upstream-watch}"
+STATE_DIR="${UPSTREAM_WATCH_STATE_DIR:-/var/lib/upstream-watch}"
+ENV_FILE="${UPSTREAM_WATCH_ENV_FILE:-${CONFIG_DIR}/env}"
+PROBE_DIR="${UPSTREAM_WATCH_PROBE_DIR:-/usr/local/libexec/upstream-watch}"
+
+# env ファイルの中身はそのまま probe に渡すので export しておく
+if [[ -f "$ENV_FILE" ]]; then
+  set -a
+  # shellcheck disable=SC1090
+  source "$ENV_FILE"
+  set +a
+fi
+export CONFIG_DIR STATE_DIR
+
+# 変化を検知したら測り直し、再現したときだけ通知する probe (空白区切り)。
+# mtr のホップ列は ECMP や無応答ホップで揺れるため既定で対象にする。
+CONFIRM_PROBES="${CONFIRM_PROBES:-mtr-upstream}"
+
+# 通知本文の上限。経路表が丸ごと化けたときに通知先を詰まらせない
+BODY_LIMIT="${BODY_LIMIT:-3000}"
+
+SENDMAIL="${SENDMAIL:-/usr/sbin/sendmail}"
+
+DRY_RUN=0
+ONLY_PROBE=""
+MATCHED=0
+
+log() { printf '%s [upstream-watch] %s\n' "$(date -Is)" "$*" >&2; }
+
+usage() {
+  cat <<'USAGE'
+usage: upstream-watch [options]
+
+  --dry-run         シグネチャを表示するだけ。通知も state 更新もしない
+  --probe NAME      指定した probe だけを実行する
+  --list            probe の一覧を表示する
+  --show            保存済みのシグネチャを表示する
+  --help
+USAGE
+}
+
+# v6 を先に試し、駄目なら v4 に落とす。片方の family が死んでいても届かせる
+curl_notify() {
+  local family
+  for family in -6 -4; do
+    if curl -sS "$family" --max-time 20 "$@" >/dev/null 2>&1; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+# sendmail はローカルキューに入れた時点で成功を返すので、配送経路が落ちていても
+# 変化を取りこぼさない。postfix が復帰まで滞留させる
+notify_mail() {
+  local title="$1" body="$2"
+  {
+    printf 'To: %s\n' "$MAIL_TO"
+    printf 'Subject: upstream-watch: %s changed on %s\n' "$title" "$(hostname -s)"
+    printf 'Content-Type: text/plain; charset=UTF-8\n'
+    printf 'Auto-Submitted: auto-generated\n'
+    printf '\n%s\n' "$body"
+  } | "$SENDMAIL" -t
+}
+
+# 本文は必ずファイル経由で渡す。diff の "@@" で始まる本文を --data-binary に
+# 直接書くと curl がファイル名と解釈する
+notify() {
+  local title="$1" body="$2"
+  local tmp rc=1
+
+  if [[ -z "${MAIL_TO:-}${NTFY_URL:-}${SLACK_WEBHOOK_URL:-}" ]]; then
+    log "通知先が未設定 (${ENV_FILE} に MAIL_TO か NTFY_URL か SLACK_WEBHOOK_URL を書く)"
+    return 1
+  fi
+
+  if [[ -n "${MAIL_TO:-}" ]]; then
+    if notify_mail "$title" "$body"; then
+      rc=0
+    else
+      log "sendmail への投函に失敗した (${SENDMAIL})"
+    fi
+  fi
+
+  tmp="$(mktemp)"
+
+  if [[ "$rc" -ne 0 && -n "${NTFY_URL:-}" ]]; then
+    printf '%s\n' "$body" > "$tmp"
+    # ntfy のヘッダは ASCII のみ。日本語は本文に置く
+    if curl_notify -H "Title: upstream-watch: ${title}" -H 'Tags: satellite_antenna' \
+         --data-binary "@${tmp}" "$NTFY_URL"; then
+      rc=0
+    else
+      log "ntfy への送信に失敗した (v6/v4 とも)"
+    fi
+  fi
+
+  if [[ "$rc" -ne 0 && -n "${SLACK_WEBHOOK_URL:-}" ]]; then
+    jq -n --arg t "$(printf '*%s*\n```\n%s\n```' "$title" "$body")" '{text: $t}' > "$tmp"
+    if curl_notify -X POST -H 'Content-Type: application/json' \
+         --data-binary "@${tmp}" "$SLACK_WEBHOOK_URL"; then
+      rc=0
+    else
+      log "Slack への送信に失敗した (v6/v4 とも)"
+    fi
+  fi
+
+  rm -f "$tmp"
+  return "$rc"
+}
+
+probe_name() { basename "$1" | sed 's/^[0-9]*-//'; }
+
+# unified diff の飾り (@@ や ---) は人が読むものではないので、増減した行だけを出す
+render_change() {
+  local name="$1" old_file="$2" new_file="$3" gone added
+  # diff は差分があると 1 を返すので pipefail に食わせない
+  gone="$(diff "$old_file" "$new_file" | sed -n 's/^< /  /p' || true)"
+  added="$(diff "$old_file" "$new_file" | sed -n 's/^> /  /p' || true)"
+
+  printf '%s の上流シグネチャが変化した (%s)\n' "$name" "$(hostname -s)"
+  if [[ -n "$gone" ]]; then
+    printf '\nなくなった:\n%s\n' "$gone"
+  fi
+  if [[ -n "$added" ]]; then
+    printf '\nふえた:\n%s\n' "$added"
+  fi
+}
+
+# MIN_INTERVAL_<PROBE NAME> で probe ごとの最短実行間隔 (秒) を指定できる
+min_interval_for() {
+  local var="MIN_INTERVAL_$(printf '%s' "$1" | tr 'a-z-' 'A-Z_')"
+  printf '%s' "${!var:-0}"
+}
+
+needs_confirm() {
+  local name="$1" p
+  for p in $CONFIRM_PROBES; do
+    [[ "$p" == "$name" ]] && return 0
+  done
+  return 1
+}
+
+probe_paths() {
+  if [[ ! -d "$PROBE_DIR" ]]; then
+    log "probe ディレクトリが無い: ${PROBE_DIR}"
+    exit 1
+  fi
+  find "$PROBE_DIR" -maxdepth 1 -type f -perm -u+x | sort
+}
+
+process_probe() {
+  local path="$1"
+  local name sig_file stamp_file min_interval new old tmp_old tmp_new body age
+
+  name="$(probe_name "$path")"
+  if [[ -n "$ONLY_PROBE" && "$name" != "$ONLY_PROBE" ]]; then
+    return 0
+  fi
+  MATCHED=1
+
+  sig_file="${STATE_DIR}/${name}.sig"
+  stamp_file="${STATE_DIR}/${name}.stamp"
+
+  min_interval="$(min_interval_for "$name")"
+  if [[ "$min_interval" -gt 0 && -f "$stamp_file" && "$DRY_RUN" -eq 0 ]]; then
+    # mtime ではなく中身の epoch で判定する (stat のオプションが OS で違う)
+    age=$(( $(date +%s) - $(cat "$stamp_file") ))
+    if (( age < min_interval )); then
+      log "間隔未満なので skip: ${name} (${age}s < ${min_interval}s)"
+      return 0
+    fi
+  fi
+
+  # stdin は /dev/null に固定する。probe が ssh のように stdin を読む場合、
+  # probe 一覧を流している while ループの残りを食ってしまう
+  if ! new="$("$path" </dev/null)"; then
+    log "probe 失敗: ${name} (skip)"
+    return 0
+  fi
+  if [[ -z "$new" ]]; then
+    log "シグネチャが空: ${name} (skip)"
+    return 0
+  fi
+
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    printf '===== %s =====\n%s\n' "$name" "$new"
+    return 0
+  fi
+
+  date +%s > "$stamp_file"
+
+  if [[ ! -f "$sig_file" ]]; then
+    printf '%s\n' "$new" > "$sig_file"
+    log "ベースライン作成: ${name}"
+    return 0
+  fi
+
+  old="$(cat "$sig_file")"
+  if [[ "$new" == "$old" ]]; then
+    log "変化なし: ${name}"
+    return 0
+  fi
+
+  if needs_confirm "$name"; then
+    local confirm
+    if ! confirm="$("$path" </dev/null)" || [[ "$confirm" != "$new" ]]; then
+      log "再測定で再現しなかったので保留: ${name}"
+      return 0
+    fi
+  fi
+
+  log "変化を検知: ${name}"
+
+  tmp_old="$(mktemp)"; tmp_new="$(mktemp)"
+  printf '%s\n' "$old" > "$tmp_old"
+  printf '%s\n' "$new" > "$tmp_new"
+  body="$(render_change "$name" "$tmp_old" "$tmp_new" | head -c "$BODY_LIMIT")"
+  rm -f "$tmp_old" "$tmp_new"
+
+  if ! notify "$name" "$body"; then
+    log "どこにも通知できなかったので state を更新しない (次回再試行): ${name}"
+    return 0
+  fi
+
+  printf '%s\n' "$new" > "$sig_file"
+}
+
+main() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --dry-run) DRY_RUN=1; shift ;;
+      --probe) ONLY_PROBE="$2"; shift 2 ;;
+      --list) probe_paths | while read -r p; do probe_name "$p"; done; return 0 ;;
+      --show)
+        for f in "$STATE_DIR"/*.sig; do
+          [[ -f "$f" ]] || continue
+          printf '===== %s =====\n' "$(basename "$f" .sig)"
+          cat "$f"
+        done
+        return 0 ;;
+      --help|-h) usage; return 0 ;;
+      *) usage >&2; return 1 ;;
+    esac
+  done
+
+  mkdir -p "$STATE_DIR"
+
+  local path found=0
+  while read -r path; do
+    found=1
+    process_probe "$path"
+  done < <(probe_paths)
+
+  if [[ "$found" -eq 0 ]]; then
+    log "実行可能な probe が無い: ${PROBE_DIR}"
+    return 1
+  fi
+  if [[ -n "$ONLY_PROBE" && "$MATCHED" -eq 0 ]]; then
+    log "そんな probe は無い: ${ONLY_PROBE} (--list で確認しろ)"
+    return 1
+  fi
+}
+
+main "$@"

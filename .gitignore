@@ -1,0 +1,3 @@
+# 実際の設定は配布しない (env.example / targets.conf.example を雛形にする)
+env
+targets.conf
