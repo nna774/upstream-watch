@@ -137,6 +137,8 @@ render_change() {
   if [[ -n "$added" ]]; then
     printf '\nふえた:\n%s\n' "$added"
   fi
+  # 差分だけだと全体像が分からないので、現在のシグネチャ (mtr なら全ホップ) も付ける
+  printf '\n現在:\n%s\n' "$(sed 's/^/  /' "$new_file")"
 }
 
 # MIN_INTERVAL_<PROBE NAME> で probe ごとの最短実行間隔 (秒) を指定できる
