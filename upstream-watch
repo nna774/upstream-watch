@@ -165,7 +165,7 @@ probe_paths() {
 
 process_probe() {
   local path="$1"
-  local name sig_file stamp_file min_interval new old tmp_old tmp_new body age
+  local name sig_file stamp_file min_interval new old tmp_old tmp_new tmp_body body age
 
   name="$(probe_name "$path")"
   if [[ -n "$ONLY_PROBE" && "$name" != "$ONLY_PROBE" ]]; then
@@ -226,11 +226,13 @@ process_probe() {
 
   log "変化を検知: ${name}"
 
-  tmp_old="$(mktemp)"; tmp_new="$(mktemp)"
+  tmp_old="$(mktemp)"; tmp_new="$(mktemp)"; tmp_body="$(mktemp)"
   printf '%s\n' "$old" > "$tmp_old"
   printf '%s\n' "$new" > "$tmp_new"
-  body="$(render_change "$name" "$tmp_old" "$tmp_new" | head -c "$BODY_LIMIT")"
-  rm -f "$tmp_old" "$tmp_new"
+  # パイプでheadに渡すと、headが先に閉じた後の書き込みがSIGPIPEになりset -eで落ちる
+  render_change "$name" "$tmp_old" "$tmp_new" > "$tmp_body"
+  body="$(head -c "$BODY_LIMIT" "$tmp_body")"
+  rm -f "$tmp_old" "$tmp_new" "$tmp_body"
 
   if ! notify "$name" "$body"; then
     log "どこにも通知できなかったので state を更新しない (次回再試行): ${name}"
