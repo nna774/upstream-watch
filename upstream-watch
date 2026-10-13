@@ -131,6 +131,7 @@ render_change() {
   added="$(diff "$old_file" "$new_file" | sed -n 's/^> /  /p' || true)"
 
   printf '%s の上流シグネチャが変化した (%s)\n' "$name" "$(hostname -s)"
+  printf '検知時刻: %s\n' "$(date '+%Y-%m-%d %H:%M:%S %z')"
   if [[ -n "$gone" ]]; then
     printf '\nなくなった:\n%s\n' "$gone"
   fi
